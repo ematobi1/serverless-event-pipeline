@@ -1,0 +1,16 @@
+directory:
+  - terraform
+framework:
+  - terraform
+compact: true
+quiet: true
+skip-path:
+  - terraform/.terraform
+skip-check:
+  # Lambda in a VPC: the function only calls AWS public endpoints over TLS and
+  # owns no private resources. A VPC would add NAT/endpoint cost without
+  # reducing exposure.
+  - CKV_AWS_117
+  # Lambda code signing needs an AWS Signer profile and a signed artifact
+  # workflow. Listed as a next step in the README.
+  - CKV_AWS_272

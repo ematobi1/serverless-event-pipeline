@@ -1,93 +1,167 @@
 # serverless-event-pipeline
 
+An order-ingestion pipeline on AWS serverless, provisioned with Terraform. GitLab CI/CD lints, tests, scans, plans, and applies it.
 
+## Architecture
 
-## Getting started
+```mermaid
+flowchart LR
+    client([Client<br/>SigV4-signed]) -->|POST /orders| apigw[API Gateway<br/>HTTP API, AWS_IAM auth]
+    apigw --> lambda[Lambda<br/>order-handler]
+    lambda -->|SendMessage| sqs[(SQS orders)]
+    sqs -->|event source mapping<br/>partial batch failures| lambda
+    sqs -.->|after 3 receives| dlq[(SQS DLQ)]
+    lambda -->|PutItem status=RECEIVED| ddb[(DynamoDB orders)]
+    lambda -->|StartExecution name=orderId| sfn[Step Functions<br/>order-workflow]
+    producer([Any producer]) -->|PutEvents<br/>OrderReprocessRequested| eb[EventBridge rule]
+    eb -->|StartExecution| sfn
+    sfn -->|UpdateItem status=PROCESSED| ddb
+    kms{{KMS CMK}} -.encrypts.-> sqs & dlq & ddb & sfn & logs[(CloudWatch Logs)]
+```
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+**Flow**
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+1. `POST /orders` hits the HTTP API. The route uses `AWS_IAM` authorization, so only signed requests from principals with `execute-api:Invoke` get through.
+2. The Lambda validates the body (`customerId`, `amount` > 0 and ≤ 1,000,000, optional `orderId` and `currency`). It enqueues the order and returns `202 {"orderId": ..., "status": "ACCEPTED"}`. Bad JSON gets `400`, a validation failure gets `422`, and both use the `{"error": {"code", "message"}}` shape.
+3. SQS invokes the same Lambda in batches. For each message it does two things:
+   - `PutItem` with `attribute_not_exists(orderId)`, so a redelivered message never overwrites an order.
+   - `StartExecution` with `name = orderId`, so a retry cannot start a second workflow.
+   Failed records are returned in `batchItemFailures`. Only those records are retried, and after 3 receives they move to the DLQ.
+4. The Step Functions workflow checks its input and then calls DynamoDB `UpdateItem` directly (no Lambda in between) to set `status=PROCESSED`, `processedAt`, and `processedBy`. Throttling errors are retried with jitter. If the order doesn't exist, the run ends in `OrderNotFound`.
+5. **EventBridge** has a custom-event rule on the default bus. A `serverless-event-pipeline.orders` / `OrderReprocessRequested` event with `detail.orderId` restarts the workflow for an existing order. I picked a custom event over a schedule because the workflow acts on a single order, and a cron trigger would have no order to pass in.
 
-## Add your files
+   ```bash
+   aws events put-events --entries '[{"Source":"serverless-event-pipeline.orders","DetailType":"OrderReprocessRequested","Detail":"{\"orderId\":\"order-001\"}"}]'
+   ```
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+**Security**
+
+- **Encryption at rest:** one customer-managed KMS key with rotation enabled. It covers both queues, DynamoDB, Lambda environment variables, Step Functions execution data, and every log group.
+- **Encryption in transit:** the queue policies deny any request that isn't TLS. All AWS APIs and API Gateway are HTTPS-only.
+- **IAM:** each service has its own role (Lambda, Step Functions, EventBridge), scoped to exact ARNs and protected by `aws:SourceAccount` / `aws:SourceArn` confused-deputy conditions. Wildcard resources appear in two places only, and AWS requires both: X-Ray trace writes, and Step Functions log delivery. Neither supports resource-level permissions.
+- **Observability:** X-Ray tracing is on for both Lambda and Step Functions. API access logs, Lambda logs, and workflow logs are kept for 365 days. Lambda writes structured JSON log lines (`order_enqueued`, `order_processed`, `order_rejected`).
+
+## Repository layout
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/kem-logistic-and-solutions/serverless-event-pipeline.git
-git branch -M main
-git push -uf origin main
+.
+├── .gitlab-ci.yml                 # lint -> test -> checkov -> plan -> apply
+├── .checkov.yml                   # Checkov config + justified skips
+├── pyproject.toml                 # ruff + pytest config
+├── requirements-dev.txt           # pinned test/lint deps
+├── bootstrap/main.tf              # one-time: state bucket, GitLab OIDC provider, deploy role
+├── src/
+│   ├── handler.py                 # Lambda (API Gateway + SQS entry points)
+│   └── requirements.txt           # pinned runtime deps (boto3 comes with the runtime)
+├── terraform/
+│   ├── versions.tf                # Terraform/provider versions, S3 backend, default tags
+│   ├── variables.tf  main.tf  outputs.tf
+│   ├── kms.tf  sqs.tf  dynamodb.tf  lambda.tf
+│   ├── apigateway.tf  stepfunctions.tf  eventbridge.tf  iam.tf
+│   └── statemachine/order_workflow.asl.json
+└── tests/
+    ├── conftest.py                # moto-backed DynamoDB, SQS, Step Functions
+    ├── test_lambda.py             # handler behaviour
+    └── test_state_machine_definition.py  # ASL static checks
 ```
 
-## Integrate with your tools
+## CI/CD stages
 
-* [Set up project integrations](https://gitlab.com/kem-logistic-and-solutions/serverless-event-pipeline/-/settings/integrations)
+| Stage | Job | What it does | Runs on |
+|---|---|---|---|
+| lint | `terraform_lint` | `terraform fmt -check`, `init -backend=false`, `validate` | every pipeline |
+| lint | `python_lint` | `ruff check` + `ruff format --check` | every pipeline |
+| test | `unit_tests` | pytest + moto, JUnit and Cobertura reports, fails under 90% coverage | every pipeline |
+| checkov | `checkov` | Scans `terraform/`. With no `PRISMA_API_KEY`, any failed check fails the job (a superset of HIGH/CRITICAL, since free Checkov has no severity data). With the key set, only HIGH and CRITICAL fail it. | every pipeline |
+| plan | `terraform_plan` | `terraform plan -out=tfplan`. The plan file, `plan.txt`, and the Lambda zip are saved as developer-only artifacts. | MRs, external PRs, default branch |
+| apply | `terraform_apply` | `terraform apply tfplan`, using exactly the reviewed plan | default branch, **manual** |
 
-## Collaborate with your team
+Plan and apply share a `resource_group`, so two runs never touch the same state at once. State lives in S3, with native lockfile locking (`use_lockfile`, which needs Terraform 1.10 or later).
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Setup
 
-## Test and Deploy
+### 1. AWS prerequisites (one time)
 
-Use the built-in continuous integration in GitLab.
+You need the AWS CLI with an admin profile and Terraform 1.10 or later.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+```bash
+cd bootstrap
+terraform init
+terraform apply -var="gitlab_project_path=kem-logistic-and-solutions/serverless-event-pipeline"
+```
 
-***
+Note the two outputs: `state_bucket` and `deploy_role_arn`. Bootstrap state is stored locally, so keep `bootstrap/terraform.tfstate` safe. It is gitignored.
 
-# Editing this README
+If the account already has a `https://gitlab.com` OIDC provider, import it first:
+`terraform import aws_iam_openid_connect_provider.gitlab arn:aws:iam::<ACCOUNT_ID>:oidc-provider/gitlab.com`.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+### 2. Repository hosting
 
-## Suggestions for a good README
+You have two options:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- **Directly on GitLab:** push this repo to the GitLab project. Pipelines run on every push.
+- **On GitHub, with CI on GitLab:** create an empty GitHub repo named `serverless-event-pipeline` and push there. Then in GitLab go to **New project → Run CI/CD for external repository → GitHub**, authorize, and pick the repo. GitLab mirrors it and runs `.gitlab-ci.yml` on pushes and pull requests (`external_pull_request_event`).
 
-## Name
-Choose a self-explaining name for your project.
+### 3. CI/CD variables
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+Set these under GitLab **Settings → CI/CD → Variables**:
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+| Variable | Required | Value | Flags |
+|---|---|---|---|
+| `TF_STATE_BUCKET` | yes | `state_bucket` output | — |
+| `AWS_ROLE_ARN` | preferred | `deploy_role_arn` output (OIDC, no static keys) | — |
+| `AWS_ACCESS_KEY_ID` | fallback only | IAM user key | Masked |
+| `AWS_SECRET_ACCESS_KEY` | fallback only | IAM user secret | Masked, Hidden |
+| `AWS_REGION` | no | default `us-east-1` | — |
+| `TF_VAR_environment` | no | `dev` / `staging` / `prod` | — |
+| `TF_STATE_KEY` | no | default `serverless-event-pipeline/<env>.tfstate` | — |
+| `PRISMA_API_KEY` | no | enables severity-based Checkov gating | Masked |
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+If you mark the variables **Protected**, they are only exposed on protected branches. In that case MR plans will fail for lack of credentials. Either leave them unprotected and rely on the OIDC trust policy plus the manual apply gate, or create a separate read-only plan role.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+When `AWS_ROLE_ARN` is set, the pipeline writes the GitLab `id_token` (audience `sts.amazonaws.com`) to a temp file and exports `AWS_WEB_IDENTITY_TOKEN_FILE`. The Terraform AWS provider and S3 backend then call `AssumeRoleWithWebIdentity` themselves, so no keys are ever stored.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### 4. First pipeline run
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+1. Push to `main`. Lint, test, checkov, and plan run automatically.
+2. Open the `terraform_plan` job and read the `plan.txt` artifact.
+3. Click ▶ on `terraform_apply`.
+4. Run a smoke test. Calls must be SigV4-signed, for example with [awscurl](https://github.com/okigan/awscurl):
+   ```bash
+   awscurl --service execute-api -X POST "$(terraform -chdir=terraform output -raw api_endpoint)/orders" \
+     -d '{"customerId":"cust-42","amount":19.99}'
+   aws dynamodb scan --table-name serverless-event-pipeline-dev-orders
+   ```
+   The item should show `status` = `PROCESSED` within a few seconds.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## Local development
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+ruff check src tests && ruff format --check src tests
+pytest --cov=src
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+cd terraform
+terraform fmt -check -recursive
+terraform init -backend=false && terraform validate
+checkov --config-file ../.checkov.yml -d .
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+## Assumptions
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+- Lambda runs Python 3.12 on arm64, one minor version above the 3.11 minimum, and arm64 is cheaper per GB-second.
+- The Lambda zip contains only `handler.py`, because boto3 is supplied by the runtime.
+- Terraform `>= 1.10` is required for S3 native locking. That still satisfies "1.5+". CI pins `hashicorp/terraform:1.10.5`.
+- Checkov skips, each justified in `.checkov.yml` or inline:
+  - `CKV_AWS_117`: Lambda in a VPC adds no value here.
+  - `CKV_AWS_272`: code signing is listed as a next step.
+  - Three key-policy false positives: a `"*"` resource in a key policy means "this key".
 
-## License
-For open source projects, say how it is licensed.
+## Next steps
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- CloudWatch alarms on DLQ depth (`ApproximateNumberOfMessagesVisible > 0`), on Lambda errors and throttles, and on Step Functions `ExecutionsFailed`, sent to SNS.
+- A DLQ redrive runbook: `aws sqs start-message-move-task --source-arn <dlq-arn>`.
+- Lambda code signing with AWS Signer, which would retire `CKV_AWS_272`.
+- Separate plan (read-only) and apply roles, with the apply role trusted only for `ref:main` and protected environments.
+- Cost: on-demand DynamoDB and HTTP API suit spiky, low traffic. Revisit provisioned capacity once traffic is steady. Shorter log retention cuts cost outside prod.

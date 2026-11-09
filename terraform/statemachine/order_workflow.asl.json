@@ -1,0 +1,84 @@
+{
+  "Comment": "Marks an order as PROCESSED. Started by the Lambda (source=lambda) or by EventBridge (source=eventbridge).",
+  "StartAt": "CheckInput",
+  "States": {
+    "CheckInput": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.orderId", "IsPresent": true },
+            { "Variable": "$.orderId", "IsString": true },
+            { "Variable": "$.source", "IsPresent": true }
+          ],
+          "Next": "MarkProcessed"
+        }
+      ],
+      "Default": "InvalidInput"
+    },
+    "MarkProcessed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": {
+          "orderId": { "S.$": "$.orderId" }
+        },
+        "ConditionExpression": "attribute_exists(orderId)",
+        "UpdateExpression": "SET #status = :status, processedAt = :processedAt, processedBy = :processedBy",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":status": { "S": "PROCESSED" },
+          ":processedAt": { "S.$": "$$.State.EnteredTime" },
+          ":processedBy": { "S.$": "$.source" }
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ProvisionedThroughputExceededException",
+            "DynamoDB.ThrottlingException",
+            "DynamoDB.InternalServerErrorException",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "ResultPath": "$.error",
+          "Next": "OrderNotFound"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "ProcessingFailed"
+        }
+      ],
+      "Next": "Processed"
+    },
+    "Processed": {
+      "Type": "Succeed"
+    },
+    "InvalidInput": {
+      "Type": "Fail",
+      "Error": "InvalidInput",
+      "Cause": "Input must contain string orderId and source"
+    },
+    "OrderNotFound": {
+      "Type": "Fail",
+      "Error": "OrderNotFound",
+      "Cause": "No order exists with the given orderId"
+    },
+    "ProcessingFailed": {
+      "Type": "Fail",
+      "Error": "ProcessingFailed",
+      "Cause": "DynamoDB update failed after retries"
+    }
+  }
+}

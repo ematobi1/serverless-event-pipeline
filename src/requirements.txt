@@ -1,0 +1,5 @@
+# Runtime dependencies of the Lambda function.
+# boto3 ships with the AWS Lambda Python runtime, so it is pinned here for local
+# parity and is NOT bundled into the deployment zip.
+boto3==1.43.126
+botocore==1.43.126

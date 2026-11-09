@@ -1,0 +1,37 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+plan.txt
+crash.log
+crash.*.log
+*.tfvars
+!example.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform/build/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+junit.xml
+
+# CI caches / reports
+.pip-cache/
+.terraform-plugin-cache/
+checkov-report/
+
+# Secrets
+.env
+.env.*
+*.pem
