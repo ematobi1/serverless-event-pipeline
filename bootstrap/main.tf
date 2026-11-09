@@ -134,11 +134,11 @@ data "aws_iam_policy_document" "deploy_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Any branch / MR of this one project. Tighten to ref:main for apply-only roles.
+    # Only the protected main branch can assume this role.
     condition {
       test     = "StringLike"
       variable = "${local.gitlab_host}:sub"
-      values   = ["project_path:${var.gitlab_project_path}:ref_type:branch:ref:*"]
+         values   = ["project_path:${var.gitlab_project_path}:ref_type:branch:ref:main"]
     }
   }
 }
